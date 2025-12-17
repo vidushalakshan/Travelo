@@ -1,40 +1,95 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:hive/hive.dart';
+import 'package:uuid/uuid.dart';
+
 import '../models/destination_model.dart';
 
 class DestinationService {
-  final FirebaseFirestore _db = FirebaseFirestore.instance;
-  final String _collection = 'destinations';
+  DestinationService({
+    FirebaseFirestore? firestore,
+    Box? destinationsBox,
+  })  : _db = firestore ?? FirebaseFirestore.instance,
+        _box = destinationsBox;
+
+  final FirebaseFirestore _db;
+  final Box? _box;
+
+  static const String _collection = 'destinations';
+  static const String _cacheKey = 'cached_destinations';
+
+  Future<Box> _openBox() async {
+    if (_box != null) return _box!;
+    return Hive.openBox('destinations');
+  }
 
   Future<List<DestinationModel>> getAllDestinations() async {
     try {
-      final snapshot = await _db.collection(_collection).get();
-      final destinations = snapshot.docs
-          .map((doc) => DestinationModel.fromJson(doc.data()))
-          .toList();
+      final snapshot = await _db.collection(_collection).orderBy('name').get();
 
-      // Cache in Hive
-      final box = await Hive.openBox('destinations');
-      await box.put('cached', destinations.map((d) => d.toJson()).toList());
+      final list = snapshot.docs.map((doc) {
+        final data = doc.data();
+        return DestinationModel.fromFirestore(doc.id, data);
+      }).toList();
 
-      return destinations;
-    } catch (e) {
+      // Cache in Hive (as List<Map>)
+      final box = await _openBox();
+      await box.put(_cacheKey, list.map((d) => d.toJson()).toList());
+
+      return list;
+    } catch (_) {
       // Fallback to cache
-      final box = await Hive.openBox('destinations');
-      final cached = box.get('cached', defaultValue: []);
-      return (cached as List).map((json) => DestinationModel.fromJson(json)).toList();
+      final box = await _openBox();
+      final cached = box.get(_cacheKey, defaultValue: []);
+
+      if (cached is List) {
+        return cached
+            .whereType<Map>()
+            .map((m) => DestinationModel.fromJson(Map<String, dynamic>.from(m)))
+            .toList();
+      }
+
+      // If cache shape is unexpected, return empty
+      return [];
     }
   }
 
-  Future<void> addDestination(DestinationModel destination) async {
-    await _db.collection(_collection).doc(destination.id).set(destination.toJson());
+  Future<DestinationModel> addDestination(DestinationModel destination) async {
+    // ✅ Generate id if empty
+    final id = destination.id.trim().isEmpty ? const Uuid().v4() : destination.id.trim();
+    final docRef = _db.collection(_collection).doc(id);
+
+    final toSave = destination.copyWith(id: id);
+    await docRef.set(toSave.toJson(), SetOptions(merge: true));
+
+    return toSave;
   }
 
   Future<void> updateDestination(DestinationModel destination) async {
-    await _db.collection(_collection).doc(destination.id).update(destination.toJson());
+    final id = destination.id.trim();
+    if (id.isEmpty) {
+      throw Exception('Destination id is missing. Cannot update.');
+    }
+
+    // ✅ set(merge:true) works even if doc doesn't exist
+    await _db.collection(_collection).doc(id).set(
+          destination.toJson(),
+          SetOptions(merge: true),
+        );
   }
 
   Future<void> deleteDestination(String id) async {
-    await _db.collection(_collection).doc(id).delete();
+    final cleanId = id.trim();
+    if (cleanId.isEmpty) return;
+    await _db.collection(_collection).doc(cleanId).delete();
+  }
+
+  Future<void> toggleFavorite(String id, bool isFavorite) async {
+    final cleanId = id.trim();
+    if (cleanId.isEmpty) return;
+
+    await _db.collection(_collection).doc(cleanId).set(
+      {'isFavorite': isFavorite},
+      SetOptions(merge: true),
+    );
   }
 }
